@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>News feeds</title>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1c1c1a; --muted: #6b6b66; --line: #dcdcd6;
+    --accent: #1d4ed8; --bad: #b42318; --card: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --fg: #ecece8; --muted: #9a9a93; --line: #35352f;
+      --accent: #7aa2ff; --bad: #ff8a80; --card: #1c1c1a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px 48px; background: var(--bg); color: var(--fg);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .muted { color: var(--muted); }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+  .btn {
+    display: inline-block; padding: 8px 14px; border-radius: 6px; text-decoration: none;
+    border: 1px solid var(--accent); color: var(--accent); font-weight: 600;
+  }
+  .btn.primary { background: var(--accent); color: var(--bg); }
+  details { margin: 12px 0; padding: 8px 12px; border: 1px solid var(--bad); border-radius: 6px; color: var(--bad); }
+  details ul { margin: 8px 0 4px; padding-left: 20px; word-break: break-all; }
+  input[type=search] {
+    width: 100%; padding: 10px 12px; margin: 8px 0 4px; font: inherit;
+    background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
+  }
+  .tablewrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+  td.date { white-space: nowrap; color: var(--muted); }
+  a { color: var(--accent); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>News feeds</h1>
+  <p id="summary" class="muted">Loading…</p>
+
+  <div class="actions">
+    <a class="btn primary" id="download" href="news_feeds.csv" download>Download CSV</a>
+  </div>
+
+  <details id="failures" hidden>
+    <summary id="failcount"></summary>
+    <ul id="faillist"></ul>
+  </details>
+
+  <input type="search" id="filter" placeholder="Filter by title, source, author or category" aria-label="Filter articles">
+  <p id="shown" class="muted"></p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Published</th><th>Title</th><th>Source</th><th>Author</th><th>Categories</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const MAX_ROWS = 300;
+const $ = (id) => document.getElementById(id);
+const fmt = new Intl.DateTimeFormat("en-GB", { dateStyle: "medium", timeStyle: "short" });
+
+function addCell(tr, text, cls) {
+  const td = document.createElement("td");
+  if (cls) td.className = cls;
+  td.textContent = text;
+  tr.appendChild(td);
+  return td;
+}
+
+function render(articles, term) {
+  const needle = term.trim().toLowerCase();
+  const hits = needle ? articles.filter((a) => a._hay.includes(needle)) : articles;
+  const body = $("rows");
+  body.replaceChildren();
+  for (const a of hits.slice(0, MAX_ROWS)) {
+    const tr = document.createElement("tr");
+    addCell(tr, a.published ? fmt.format(new Date(a.published)) : "", "date");
+    const titleCell = addCell(tr, "");
+    if (/^https?:\/\//.test(a.link)) {
+      const link = document.createElement("a");
+      link.href = a.link;
+      link.textContent = a.title || a.link;
+      link.target = "_blank";
+      link.rel = "noopener";
+      titleCell.appendChild(link);
+    } else {
+      titleCell.textContent = a.title;
+    }
+    addCell(tr, a.source);
+    addCell(tr, a.author);
+    addCell(tr, a.categories.split(" | ").slice(0, 4).join(", "));
+    body.appendChild(tr);
+  }
+  $("shown").textContent =
+    `Showing ${Math.min(hits.length, MAX_ROWS)} of ${hits.length} articles` +
+    (hits.length > MAX_ROWS ? ". The CSV has them all." : ".");
+}
+
+async function load() {
+  const [status, articles] = await Promise.all([
+    fetch("status.json").then((r) => r.json()),
+    fetch("articles.json").then((r) => r.json()),
+  ]);
+
+  const day = new Intl.DateTimeFormat("en-GB", { dateStyle: "long", timeZone: "UTC" });
+  const since = status.date_from ? ` from ${day.format(new Date(status.date_from + "T00:00:00Z"))} onwards` : "";
+  const left = (status.items_older_left_out ? `, with ${status.items_older_left_out} older items left out` : "") +
+    (status.items_carried_over ? `, and ${status.items_carried_over} articles kept from earlier runs` : "");
+  $("summary").textContent =
+    `${status.feeds_ok} of ${status.feeds_total} feeds fetched, giving ${status.items_unique} articles${since} ` +
+    `(${status.items_total} items fetched before duplicates were merged${left}). Last run ${fmt.format(new Date(status.generated_at))}.`;
+
+  if (status.failures.length) {
+    $("failcount").textContent = `${status.failures.length} feed(s) failed`;
+    for (const f of status.failures) {
+      const li = document.createElement("li");
+      li.textContent = `${f.url} (${f.error})`;
+      $("faillist").appendChild(li);
+    }
+    $("failures").hidden = false;
+  }
+
+  for (const a of articles) a._hay = `${a.title} ${a.source} ${a.author} ${a.categories}`.toLowerCase();
+  render(articles, "");
+  $("filter").addEventListener("input", (e) => render(articles, e.target.value));
+}
+
+load().catch(() => {
+  $("summary").textContent = "No data yet. The first scheduled run will build the CSV, or start one from the Actions tab.";
+  $("download").hidden = true;
+});
+</script>
+</body>
+</html>
