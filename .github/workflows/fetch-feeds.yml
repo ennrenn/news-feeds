@@ -1,0 +1,75 @@
+name: Fetch feeds
+
+on:
+  # The "Run workflow" button on the Actions tab.
+  workflow_dispatch:
+  # Every three hours, at 17 minutes past (UTC). GitHub often starts scheduled runs
+  # late, sometimes by an hour or two, and now and then skips one.
+  schedule:
+    - cron: "17 */3 * * *"
+
+permissions:
+  contents: write   # lets the run save the CSV back into the repository
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # A normal run takes one to five minutes. If one is still going after fifteen,
+    # stop it, so a stuck run cannot hold up the ones behind it.
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch feeds and build CSV
+        run: python scripts/fetch_feeds.py
+
+      # Save the CSV in the repository (data/news_feeds.csv). The next run starts
+      # from this copy, so articles are kept for the whole date window even after the
+      # feeds themselves have moved on. This also happens before the Pages step, so
+      # the data is safe even if publishing the site fails.
+      - name: Save the CSV in the repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/news_feeds.csv
+          if git diff --cached --quiet; then
+            echo "No change to save."
+          else
+            git commit -m "Update feeds data"
+            git pull --rebase
+            git push
+          fi
+
+      # A second copy of the CSV, kept on the run's own page, so it can be downloaded
+      # even if the Pages step below is slow or fails.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: news-feeds-csv
+          path: site/news_feeds.csv
+          retention-days: 14
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+        with:
+          # A normal deployment takes under a minute. If it has not finished after
+          # three minutes, stop waiting (and cancel it) instead of hanging for ten.
+          timeout: 180000
