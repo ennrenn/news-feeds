@@ -125,6 +125,9 @@ https://www.telegraph.co.uk/technology/rss.xml
 https://www.telegraph.co.uk/business/rss.xml
 https://www.telegraph.co.uk/news/rss.xml
 
+# The Independent 
+https://www.independent.co.uk/news/uk/rss
+
 # Google News (UK top stories)
 https://news.google.com/rss?hl=en-GB&gl=GB&ceid=GB:en
 
