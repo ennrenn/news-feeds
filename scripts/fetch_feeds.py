@@ -17,6 +17,7 @@ Uses only the Python standard library, so there is nothing to install.
 
 import argparse
 import csv
+import gzip
 import html
 import json
 import re
@@ -77,6 +78,17 @@ def read_feeds(path):
     return urls
 
 
+def unpack(body):
+    """Undo gzip compression, which some sites send whether or not it was asked for,
+    and drop any blank space or byte order mark ahead of the XML."""
+    if body[:2] == b"\x1f\x8b":
+        try:
+            body = gzip.decompress(body)
+        except (OSError, EOFError):
+            pass
+    return body.lstrip(b"\xef\xbb\xbf \t\r\n")
+
+
 def fetch(url):
     """Return (bytes, None) on success or (None, message) on failure."""
     last = "unknown error"
@@ -86,9 +98,10 @@ def fetch(url):
             req = urllib.request.Request(url, headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
+                "Accept-Encoding": "gzip",
             })
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-                return resp.read(), None
+                return unpack(resp.read()), None
         except urllib.error.HTTPError as e:
             last = f"HTTP {e.code}"
             if e.code not in (429, 500, 502, 503, 504):
@@ -161,7 +174,7 @@ def clean_category(text):
     """Tidy one category label. The Telegraph's internal tags ('structure:business',
     'storytype:standard') are dropped, and its topics ('topics:things/uk-economy')
     become plain words ('uk economy'). Other labels are left as they are."""
-    text = text.strip()
+    text = html.unescape(text).strip()   # the Independent's CDATA labels arrive as 'News &amp; Advice'
     # Yahoo News adds housekeeping tags such as 'site|news' and 'region|US'; these are dropped.
     # Any other label with a '|' in it has it swapped for '/', because ' | ' separates the
     # categories in the CSV.
@@ -260,7 +273,9 @@ def process(url):
     try:
         title, items = parse_feed(data)
     except (ET.ParseError, ValueError) as e:
-        return {"url": url, "title": "", "items": [], "error": f"could not read as RSS: {e}"}
+        # Show how the response began, so a block page or other non-RSS reply is easy to spot.
+        start = re.sub(r"\s+", " ", data[:100].decode("utf-8", "replace")).strip()
+        return {"url": url, "title": "", "items": [], "error": f"could not read as RSS: {e}. The response began: {start!r}"}
     return {"url": url, "title": title, "items": items, "error": ""}
 
 
