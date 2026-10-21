@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Fetch every RSS feed listed in feeds.txt and merge the items into one CSV.
+"""Fetch every RSS feed in feeds.txt, and the GOV.UK watch list, and merge them into one CSV.
+
+The GOV.UK part reads the topic names in govuk_topics.txt, rebuilds GOV.UK's topic tree
+live from the Content API, and pulls the newest content across those topics from the
+Search API. It is treated as one more source, so it shares the date window, the saved
+history and the status panel with the news feeds.
 
 Writes three files to the output folder (default: site/):
   news_feeds.csv      one row per article, with duplicates across feeds merged
   articles.json       the same rows without descriptions, for the preview page
-  status.json         what happened to each feed, for the status panel
+  status.json         what happened to each source, for the status panel
 
 It also keeps a saved copy of the CSV (default: data/news_feeds.csv). Each run
 starts from that copy, adds what the feeds hold today, and drops anything older than
@@ -30,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 USER_AGENT = "Mozilla/5.0 (compatible; feed-collector/1.0)"
@@ -47,6 +52,26 @@ LEGACY_ARCHIVE = ROOT / "data" / "guardian_feeds.csv"
 # Longest summary kept, in characters. Yahoo News puts whole articles in its summaries, and
 # a spreadsheet cell cannot hold more than about 32,000 characters. Use None for no limit.
 MAX_DESCRIPTION = 1000
+
+# GOV.UK watch list. The topic names to watch are in govuk_topics.txt, one per line, written
+# exactly as GOV.UK titles them. Delete that file (or run with --no-govuk) to leave GOV.UK out.
+GOVUK_TOPICS = ROOT / "govuk_topics.txt"
+GOVUK_CONTENT = "https://www.gov.uk/api/content"       # Content API: the topic tree
+GOVUK_SEARCH = "https://www.gov.uk/api/search.json"    # Search API: the content itself
+GOVUK_MAX_RESULTS = 1500                               # newest first, across all the topics
+# The 20 top-level branches of GOV.UK's topic tree. The Content API returns each one's whole
+# subtree in a single call, so this is 20 requests, not one per topic.
+GOVUK_BRANCHES = [
+    "health-and-social-care", "money", "crime-justice-and-law", "defence-and-armed-forces",
+    "work", "life-circumstances", "welfare", "housing-local-and-community",
+    "society-and-culture", "international", "regional-and-local-government", "government/all",
+    "environment", "business-and-industry", "transport", "education", "going-and-being-abroad",
+    "entering-staying-uk", "childcare-parenting", "corporate-information",
+]
+GOVUK_FIELDS = [
+    "title", "description", "link", "public_timestamp", "format", "organisations", "taxons",
+    "content_id", "content_store_document_type",
+]
 
 # Date filter. Articles published before the cut-off are left out of the CSV.
 # MAX_AGE_DAYS is a rolling window that moves with the day you run the script.
@@ -89,7 +114,10 @@ def unpack(body):
     return body.lstrip(b"\xef\xbb\xbf \t\r\n")
 
 
-def fetch(url):
+RSS_ACCEPT = "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5"
+
+
+def fetch(url, accept=RSS_ACCEPT):
     """Return (bytes, None) on success or (None, message) on failure."""
     last = "unknown error"
     for attempt in range(1, ATTEMPTS + 1):
@@ -97,7 +125,7 @@ def fetch(url):
         try:
             req = urllib.request.Request(url, headers={
                 "User-Agent": USER_AGENT,
-                "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
+                "Accept": accept,
                 "Accept-Encoding": "gzip",
             })
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
@@ -279,6 +307,121 @@ def process(url):
     return {"url": url, "title": title, "items": items, "error": ""}
 
 
+# ---- GOV.UK ----------------------------------------------------------------------------
+
+def get_json(url):
+    """Fetch a GOV.UK API address and return the decoded JSON. Raises RuntimeError on failure."""
+    data, error = fetch(url, accept="application/json")
+    if error:
+        raise RuntimeError(error)
+    try:
+        return json.loads(data)
+    except ValueError as e:
+        raise RuntimeError(f"not valid JSON ({e})")
+
+
+def walk_taxons(node, names):
+    """Record the title of this topic, and of every topic beneath it (id -> title)."""
+    if not isinstance(node, dict) or not node.get("content_id"):
+        return
+    names[node["content_id"]] = node.get("title") or "(untitled)"
+    for child in (node.get("links") or {}).get("child_taxons") or []:
+        walk_taxons(child, names)
+
+
+def load_taxonomy():
+    """Rebuild GOV.UK's topic tree. Returns (id -> title, the branches that failed to load)."""
+    names, failed = {}, []
+
+    def one(branch):
+        try:
+            return branch, get_json(f"{GOVUK_CONTENT}/{branch}"), ""
+        except RuntimeError as e:
+            return branch, None, str(e)
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for branch, tree, error in pool.map(one, GOVUK_BRANCHES):
+            if error:
+                failed.append(f"{branch} ({error})")
+            else:
+                walk_taxons(tree, names)
+    return names, failed
+
+
+def govuk_item(r, names):
+    """One Search API result in the same shape as an RSS item, or None if it has no link.
+    The department(s) go in the author column; the format (such as 'news story') and the
+    topic names go in categories."""
+    link = r.get("link") or ""
+    if link.startswith("/"):
+        link = "https://www.gov.uk" + link
+    if not link:
+        return None
+    departments = [o.get("title", "") if isinstance(o, dict) else str(o)
+                   for o in r.get("organisations") or []]
+    topics = []
+    for t in r.get("taxons") or []:
+        if isinstance(t, dict):
+            topics.append(t.get("title") or names.get(t.get("content_id"), ""))
+        else:
+            topics.append(names.get(t, ""))   # a plain topic ID; unknown ones are left out
+    kind = (r.get("format") or r.get("content_store_document_type") or "").replace("_", " ")
+    categories = [c.replace("|", "/").strip() for c in [kind] + topics if c and c.strip()]
+    return {
+        "title": clean(r.get("title")),
+        "link": link,
+        "guid": r.get("content_id") or link,
+        "published": to_iso(r.get("public_timestamp")),
+        "author": "; ".join(d for d in departments if d),
+        "categories": list(dict.fromkeys(categories)),
+        "description": shorten(clean(r.get("description")), MAX_DESCRIPTION),
+        "image_url": "",
+    }
+
+
+def process_govuk(titles):
+    """Pull the newest GOV.UK content across the watch-list topics. Returns a result in the
+    same shape as process(), plus a list of warnings about anything that went partly wrong."""
+    result = {"url": GOVUK_SEARCH, "title": "GOV.UK watch list", "items": [], "error": "",
+              "name": "gov.uk/watch-list", "source": "gov.uk", "warnings": []}
+    names, failed = load_taxonomy()
+    if failed:
+        result["warnings"].append(
+            f"Could not load {len(failed)} of {len(GOVUK_BRANCHES)} GOV.UK topic branches: " + ", ".join(failed))
+    if not names:
+        result["error"] = "could not load the GOV.UK topic tree"
+        return result
+    by_title = {}
+    for topic_id, title in names.items():
+        by_title.setdefault(title, []).append(topic_id)
+    ids, missing = [], []
+    for title in titles:
+        if title in by_title:
+            ids.extend(by_title[title])
+        else:
+            missing.append(title)
+    if missing:
+        result["warnings"].append(
+            f"{len(missing)} watch-list topic(s) not found on GOV.UK, so skipped (renamed, or their "
+            "branch failed to load): " + "; ".join(missing))
+    if not ids:
+        result["error"] = "none of the watch-list topics were found on GOV.UK"
+        return result
+    query = ([("filter_part_of_taxonomy_tree[]", i) for i in dict.fromkeys(ids)]
+             + [("order", "-public_timestamp"), ("count", str(GOVUK_MAX_RESULTS))]
+             + [("fields", f) for f in GOVUK_FIELDS])
+    try:
+        data = get_json(GOVUK_SEARCH + "?" + urlencode(query))
+    except RuntimeError as e:
+        result["error"] = str(e)
+        return result
+    for r in data.get("results") or []:
+        item = govuk_item(r, names)
+        if item:
+            result["items"].append(item)
+    return result
+
+
 def host_of(url):
     """Website name without 'www.', e.g. 'fenews.co.uk'."""
     host = urlparse(url).netloc.lower()
@@ -313,7 +456,8 @@ def load_archive(path):
                 rows.append({
                     "title": r.get("title", ""), "link": r.get("link", ""),
                     "guid": r.get("guid") or r.get("link", ""), "source": r.get("source", ""),
-                    "published": r.get("published", ""), "author": r.get("author", ""),
+                    # Back to the internal form, whichever way the saved copy was written.
+                    "published": to_iso(r.get("published", "")), "author": r.get("author", ""),
                     "categories": [c for c in r.get("categories", "").split(" | ") if c],
                     "description": r.get("description", ""), "image_url": r.get("image_url", ""),
                     "feeds": [x for x in r.get("source_feeds", "").split(" | ") if x],
@@ -344,8 +488,8 @@ def merge(results, cutoff="", previous=()):
     for result in results:
         if result["error"]:
             continue
-        name = feed_name(result["url"])
-        source = host_of(result["url"])
+        name = result.get("name") or feed_name(result["url"])
+        source = result.get("source") or host_of(result["url"])
         for item in result["items"]:
             total += 1
             if cutoff and item["published"] and item["published"] < cutoff:
@@ -389,12 +533,18 @@ def cutoff_from(start_date, max_age_days):
     return max(limits) if limits else ""
 
 
+def excel_date(iso):
+    """'2026-10-21T15:08:12Z' becomes '2026-10-21 15:08:12'. Excel treats the first form as
+    text, so it cannot sort or filter on it; the second it reads as a date and time (UTC)."""
+    return iso.replace("T", " ").rstrip("Z")
+
+
 def flatten(row):
     return {
         "title": row["title"],
         "link": row["link"],
         "source": row["source"],
-        "published": row["published"],
+        "published": excel_date(row["published"]),
         "author": row["author"],
         "categories": " | ".join(row["categories"]),
         "description": row["description"] if INCLUDE_DESCRIPTION else "",
@@ -416,14 +566,18 @@ def main():
     parser.add_argument("--archive", type=Path, default=ARCHIVE if KEEP_HISTORY else None, metavar="FILE",
                         help="saved copy of the CSV that each run builds on (default: data/news_feeds.csv)")
     parser.add_argument("--no-history", action="store_true", help="ignore and do not update the saved copy")
+    parser.add_argument("--govuk-topics", type=Path, default=GOVUK_TOPICS, metavar="FILE",
+                        help="file listing the GOV.UK topics to watch (default: govuk_topics.txt)")
+    parser.add_argument("--no-govuk", action="store_true", help="leave the GOV.UK watch list out of this run")
     args = parser.parse_args()
     if args.no_history:
         args.archive = None
     cutoff = cutoff_from(args.from_date, args.max_age_days)
 
     urls = read_feeds(args.feeds)
-    if not urls:
-        sys.exit(f"No feed URLs found in {args.feeds}")
+    topics = read_feeds(args.govuk_topics) if (not args.no_govuk and args.govuk_topics.exists()) else []
+    if not urls and not topics:
+        sys.exit(f"No feed URLs found in {args.feeds}, and no GOV.UK topics to watch.")
 
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         results = list(pool.map(process, urls))
@@ -438,11 +592,16 @@ def main():
             results[i] = process(urls[i])
             time.sleep(3)
 
+    # GOV.UK counts as one more source, with its own list of topics to watch.
+    if topics:
+        results.append(process_govuk(topics))
+
     failures = [{"url": r["url"], "error": r["error"]} for r in results if r["error"]]
-    if len(failures) == len(urls):
+    warnings = [w for r in results for w in r.get("warnings", [])]
+    if len(failures) == len(results):
         for fail in failures:
             print(f"  FAILED {fail['url']}: {fail['error']}")
-        sys.exit("No feeds could be fetched, so nothing has been changed.")
+        sys.exit("No sources could be fetched, so nothing has been changed.")
 
     previous = load_archive(args.archive)
     if args.archive == ARCHIVE and not ARCHIVE.exists() and LEGACY_ARCHIVE.exists():
@@ -466,18 +625,21 @@ def main():
 
     preview_cols = ["title", "link", "source", "published", "author", "categories", "feed_count"]
     with open(args.out / "articles.json", "w", encoding="utf-8") as f:
-        json.dump([{k: r[k] for k in preview_cols} for r in flat], f, ensure_ascii=False)
+        # The page reads these dates as UTC, so they keep the 'T' and 'Z' form.
+        json.dump([{**{k: out[k] for k in preview_cols}, "published": row["published"]}
+                   for row, out in zip(rows, flat)], f, ensure_ascii=False)
 
     status = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "feeds_total": len(urls),
-        "feeds_ok": len(urls) - len(failures),
+        "feeds_total": len(results),
+        "feeds_ok": len(results) - len(failures),
         "items_total": total,
         "items_unique": len(rows),
         "date_from": cutoff[:10],
         "items_older_left_out": old,
         "items_carried_over": carried,
         "failures": failures,
+        "warnings": warnings,
         "feeds": [{"url": r["url"], "title": r["title"], "items": len(r["items"]), "error": r["error"]}
                   for r in results],
     }
@@ -494,6 +656,8 @@ def main():
             print("  Warning: no articles are newer than the cut-off, so the CSV is empty.")
     for fail in failures:
         print(f"  FAILED {fail['url']}: {fail['error']}")
+    for warning in warnings:
+        print(f"  NOTE {warning}")
     print(f"CSV saved to: {(args.out / CSV_NAME).resolve()}")
 
 
